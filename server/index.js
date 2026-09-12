@@ -1,33 +1,36 @@
 // API de "Amigos" para el launcher SKY ASHES 2 / V-SPACE.
 //
 // Qué hace:
-// - Cada launcher, mientras hay sesión de Microsoft iniciada, manda un "heartbeat" acá
-//   (POST /api/heartbeat) con el uuid y nombre premium del jugador. Esto es lo que arma
-//   la lista de "todas las personas que tienen el launcher": se registra sola, nadie
-//   agrega ni saca amigos a mano.
+// - Cada launcher, apenas se abre (tenga o no sesión de Microsoft iniciada), manda un
+//   "heartbeat" acá (POST /api/heartbeat) con: un "id" de instalación (generado una sola
+//   vez y guardado localmente, NO es la cuenta de Microsoft), el nickname editable, y si
+//   hay sesión: el uuid + nombre premium reales. Esto arma la lista de "todas las personas
+//   que tienen el launcher abierto": se registra sola, y aparece aunque el jugador todavía
+//   no haya iniciado sesión.
 // - GET /api/friends devuelve esa lista a TODOS los launchers (pública, de solo lectura).
 //   No incluye a nadie bloqueado.
 // - Los endpoints /api/admin/* (bloquear, desbloquear, eliminar) están protegidos con una
-//   clave secreta (ADMIN_KEY) que solo vos conocés. Un jugador bloqueado deja de poder
-//   loguearse/jugar (el launcher corta el login) y desaparece de la lista pública.
+//   clave secreta (ADMIN_KEY) que solo vos conocés.
 //
-// Guarda los datos en Turso (SQLite en la nube, plan gratis SIN expiración), para que
-// sobreviva a los reinicios/deploys de Render sin perder la lista cada 30 días como
-// pasaría con la Postgres gratis de Render.
+// Nota sobre el bloqueo: cada fila es una "instalación del launcher", no directamente una
+// cuenta de Microsoft. Si esa instalación YA tiene un uuid de Microsoft asociado, el
+// bloqueo se propaga automáticamente a cualquier otra instalación que use la misma cuenta
+// (reinstalar no sirve para evadirlo, el uuid no se puede falsificar). Pero si bloqueás a
+// alguien que TODAVÍA no inició sesión (sin uuid), podría evadirlo borrando los datos
+// locales del launcher (le generaría un id nuevo). Es una limitación inherente a mostrar
+// gente en la lista sin exigirles cuenta.
+//
+// Guarda los datos en Turso (SQLite en la nube, plan gratis SIN expiración).
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@libsql/client');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
-// Ventana de "en línea": si el último heartbeat de alguien fue hace menos de esto, se
-// muestra como online. El launcher manda un heartbeat cada 60s mientras está abierto
-// (ver src/main.js), así que 150s da margen de sobra sin que parpadee entre online/offline.
 const ONLINE_WINDOW_SECONDS = parseInt(process.env.ONLINE_WINDOW_SECONDS || '150', 10);
 
 if (!ADMIN_KEY) {
-  console.warn('[ADVERTENCIA] No configuraste ADMIN_KEY como variable de entorno: ' +
-    'los endpoints de administración van a rechazar TODOS los pedidos hasta que la configures.');
+  console.warn('[ADVERTENCIA] No configuraste ADMIN_KEY: los endpoints de administración van a rechazar todo hasta que la configures.');
 }
 if (!process.env.TURSO_DATABASE_URL) {
   console.warn('[ADVERTENCIA] Falta TURSO_DATABASE_URL: la API no va a poder guardar nada.');
@@ -38,17 +41,43 @@ const db = createClient({
   authToken: process.env.TURSO_AUTH_TOKEN
 });
 
+// IMPORTANTE si venís del esquema viejo (players.uuid como PRIMARY KEY): la clave primaria
+// ahora es "id" (instalación local), no el uuid de Microsoft, porque necesitamos poder
+// mostrar gente que todavía no inició sesión. Si ya tenías la tabla vieja en Turso, borrala
+// una vez antes de deployar esta versión (turso db shell <db> "DROP TABLE players;"); se
+// vuelve a crear sola y la lista arranca de cero.
 async function initDb() {
   await db.execute(`
     CREATE TABLE IF NOT EXISTS players (
-      uuid TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
+      id TEXT PRIMARY KEY,
+      uuid TEXT,
+      name TEXT,
+      custom_name TEXT,
+      status TEXT NOT NULL DEFAULT 'online',
       last_seen INTEGER NOT NULL,
       banned INTEGER NOT NULL DEFAULT 0,
       banned_reason TEXT,
       first_seen INTEGER NOT NULL
     )
   `);
+}
+
+function computeState(row, now) {
+  const isRecent = (now - Number(row.last_seen)) < ONLINE_WINDOW_SECONDS * 1000;
+  if (!isRecent) return 'offline';
+  return row.status === 'away' ? 'away' : 'online';
+}
+
+function toPublicFriend(row, now) {
+  return {
+    id: row.id,
+    // "name" es el apodo editable (lápiz); si nunca lo pusieron, el nombre premium, y si
+    // tampoco hay eso (todavía no logueó), un genérico.
+    name: row.custom_name || row.name || 'Jugador',
+    premiumName: row.name || null,
+    uuid: row.uuid || null,
+    state: computeState(row, now) // 'online' | 'away' | 'offline'
+  };
 }
 
 const app = express();
@@ -58,40 +87,56 @@ app.use(express.json());
 app.get('/', (req, res) => res.json({ ok: true, service: 'sky-ashes-friends-api' }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// ---------- Heartbeat (lo llama cada launcher con sesión activa) ----------
+// ---------- Heartbeat (lo llama cada launcher apenas se abre, con o sin sesión) ----------
 app.post('/api/heartbeat', async (req, res) => {
   try {
-    const { uuid, name } = req.body || {};
-    if (!uuid || !name || typeof uuid !== 'string' || typeof name !== 'string') {
-      return res.status(400).json({ error: 'Falta uuid o name.' });
+    const { id, uuid, name, customName, status } = req.body || {};
+    if (!id || typeof id !== 'string') {
+      return res.status(400).json({ error: 'Falta id.' });
     }
     const now = Date.now();
+    const safeStatus = status === 'away' ? 'away' : 'online';
+    const safeCustomName = typeof customName === 'string' ? customName.trim().slice(0, 20) : null;
+    const safeUuid = typeof uuid === 'string' && uuid ? uuid : null;
+    const safeName = typeof name === 'string' && name ? name : null;
 
-    const existing = await db.execute({
-      sql: 'SELECT banned, banned_reason FROM players WHERE uuid = ?',
-      args: [uuid]
-    });
+    const existing = await db.execute({ sql: 'SELECT * FROM players WHERE id = ?', args: [id] });
+
+    // Si esta cuenta de Microsoft ya está bloqueada desde OTRA instalación, el bloqueo se
+    // hereda acá también.
+    let inheritedBan = null;
+    if (safeUuid) {
+      const bannedElsewhere = await db.execute({
+        sql: 'SELECT banned, banned_reason FROM players WHERE uuid = ? AND banned = 1 LIMIT 1',
+        args: [safeUuid]
+      });
+      if (bannedElsewhere.rows.length) inheritedBan = bannedElsewhere.rows[0];
+    }
 
     if (existing.rows.length === 0) {
       await db.execute({
-        sql: 'INSERT INTO players (uuid, name, last_seen, banned, first_seen) VALUES (?, ?, ?, 0, ?)',
-        args: [uuid, name, now, now]
+        sql: `INSERT INTO players (id, uuid, name, custom_name, status, last_seen, banned, banned_reason, first_seen)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          id, safeUuid, safeName, safeCustomName, safeStatus, now,
+          inheritedBan ? 1 : 0, inheritedBan ? inheritedBan.banned_reason : null, now
+        ]
       });
-      return res.json({ banned: false });
+      return res.json({ banned: !!inheritedBan, bannedReason: inheritedBan ? inheritedBan.banned_reason : null });
     }
 
-    // Actualiza nombre (por si cambió el nombre de Minecraft) y last_seen siempre,
-    // pero NO toca el estado de baneo: eso solo lo cambia un admin.
+    const row = existing.rows[0];
+    const banned = !!row.banned || !!inheritedBan;
+    const bannedReason = row.banned ? row.banned_reason : (inheritedBan ? inheritedBan.banned_reason : null);
+
     await db.execute({
-      sql: 'UPDATE players SET name = ?, last_seen = ? WHERE uuid = ?',
-      args: [name, now, uuid]
+      sql: `UPDATE players SET uuid = COALESCE(?, uuid), name = COALESCE(?, name),
+            custom_name = ?, status = ?, last_seen = ?, banned = ?, banned_reason = ?
+            WHERE id = ?`,
+      args: [safeUuid, safeName, safeCustomName, safeStatus, now, banned ? 1 : 0, bannedReason, id]
     });
 
-    const row = existing.rows[0];
-    return res.json({
-      banned: !!row.banned,
-      bannedReason: row.banned_reason || null
-    });
+    return res.json({ banned, bannedReason: bannedReason || null });
   } catch (err) {
     console.error('Error en /api/heartbeat:', err);
     res.status(500).json({ error: 'Error interno.' });
@@ -101,13 +146,11 @@ app.post('/api/heartbeat', async (req, res) => {
 // ---------- Lista pública de amigos ----------
 app.get('/api/friends', async (req, res) => {
   try {
-    const result = await db.execute('SELECT uuid, name, last_seen FROM players WHERE banned = 0 ORDER BY name COLLATE NOCASE ASC');
+    const result = await db.execute('SELECT * FROM players WHERE banned = 0');
     const now = Date.now();
-    const friends = result.rows.map((row) => ({
-      uuid: row.uuid,
-      name: row.name,
-      online: (now - Number(row.last_seen)) < ONLINE_WINDOW_SECONDS * 1000
-    }));
+    const friends = result.rows
+      .map((row) => toPublicFriend(row, now))
+      .sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
     res.json({ friends });
   } catch (err) {
     console.error('Error en /api/friends:', err);
@@ -127,15 +170,15 @@ function requireAdmin(req, res, next) {
 // Lista completa para el panel de admin (incluye bloqueados)
 app.get('/api/admin/friends', requireAdmin, async (req, res) => {
   try {
-    const result = await db.execute('SELECT uuid, name, last_seen, banned, banned_reason FROM players ORDER BY name COLLATE NOCASE ASC');
+    const result = await db.execute('SELECT * FROM players');
     const now = Date.now();
-    const friends = result.rows.map((row) => ({
-      uuid: row.uuid,
-      name: row.name,
-      online: (now - Number(row.last_seen)) < ONLINE_WINDOW_SECONDS * 1000,
-      banned: !!row.banned,
-      bannedReason: row.banned_reason || null
-    }));
+    const friends = result.rows
+      .map((row) => ({
+        ...toPublicFriend(row, now),
+        banned: !!row.banned,
+        bannedReason: row.banned_reason || null
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
     res.json({ friends });
   } catch (err) {
     console.error('Error en /api/admin/friends:', err);
@@ -145,12 +188,14 @@ app.get('/api/admin/friends', requireAdmin, async (req, res) => {
 
 app.post('/api/admin/ban', requireAdmin, async (req, res) => {
   try {
-    const { uuid, reason } = req.body || {};
-    if (!uuid) return res.status(400).json({ error: 'Falta uuid.' });
-    await db.execute({
-      sql: 'UPDATE players SET banned = 1, banned_reason = ? WHERE uuid = ?',
-      args: [reason || null, uuid]
-    });
+    const { id, reason } = req.body || {};
+    if (!id) return res.status(400).json({ error: 'Falta id.' });
+    const row = (await db.execute({ sql: 'SELECT uuid FROM players WHERE id = ?', args: [id] })).rows[0];
+    await db.execute({ sql: 'UPDATE players SET banned = 1, banned_reason = ? WHERE id = ?', args: [reason || null, id] });
+    // Propaga el bloqueo a cualquier otra instalación que ya haya usado la misma cuenta.
+    if (row && row.uuid) {
+      await db.execute({ sql: 'UPDATE players SET banned = 1, banned_reason = ? WHERE uuid = ?', args: [reason || null, row.uuid] });
+    }
     res.json({ success: true });
   } catch (err) {
     console.error('Error en /api/admin/ban:', err);
@@ -160,12 +205,13 @@ app.post('/api/admin/ban', requireAdmin, async (req, res) => {
 
 app.post('/api/admin/unban', requireAdmin, async (req, res) => {
   try {
-    const { uuid } = req.body || {};
-    if (!uuid) return res.status(400).json({ error: 'Falta uuid.' });
-    await db.execute({
-      sql: 'UPDATE players SET banned = 0, banned_reason = NULL WHERE uuid = ?',
-      args: [uuid]
-    });
+    const { id } = req.body || {};
+    if (!id) return res.status(400).json({ error: 'Falta id.' });
+    const row = (await db.execute({ sql: 'SELECT uuid FROM players WHERE id = ?', args: [id] })).rows[0];
+    await db.execute({ sql: 'UPDATE players SET banned = 0, banned_reason = NULL WHERE id = ?', args: [id] });
+    if (row && row.uuid) {
+      await db.execute({ sql: 'UPDATE players SET banned = 0, banned_reason = NULL WHERE uuid = ?', args: [row.uuid] });
+    }
     res.json({ success: true });
   } catch (err) {
     console.error('Error en /api/admin/unban:', err);
@@ -173,13 +219,12 @@ app.post('/api/admin/unban', requireAdmin, async (req, res) => {
   }
 });
 
-// Elimina a alguien de la lista (no lo bloquea: si vuelve a loguearse, reaparece).
-// Útil para limpiar cuentas de prueba, gente que ya no juega, etc.
+// Elimina a alguien de la lista (no lo bloquea: si vuelve a abrir el launcher, reaparece).
 app.post('/api/admin/delete', requireAdmin, async (req, res) => {
   try {
-    const { uuid } = req.body || {};
-    if (!uuid) return res.status(400).json({ error: 'Falta uuid.' });
-    await db.execute({ sql: 'DELETE FROM players WHERE uuid = ?', args: [uuid] });
+    const { id } = req.body || {};
+    if (!id) return res.status(400).json({ error: 'Falta id.' });
+    await db.execute({ sql: 'DELETE FROM players WHERE id = ?', args: [id] });
     res.json({ success: true });
   } catch (err) {
     console.error('Error en /api/admin/delete:', err);
