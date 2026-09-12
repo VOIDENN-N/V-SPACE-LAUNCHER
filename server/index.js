@@ -50,6 +50,7 @@ async function initDb() {
   await db.execute(`
     CREATE TABLE IF NOT EXISTS players (
       id TEXT PRIMARY KEY,
+      known_uuid TEXT,
       uuid TEXT,
       name TEXT,
       custom_name TEXT,
@@ -60,6 +61,12 @@ async function initDb() {
       first_seen INTEGER NOT NULL
     )
   `);
+  // Migración suave para bases creadas con la versión anterior de este mismo esquema nuevo
+  // (la que todavía no tenía "known_uuid"). Si la columna ya existe, esto tira un error que
+  // ignoramos a propósito.
+  try {
+    await db.execute('ALTER TABLE players ADD COLUMN known_uuid TEXT');
+  } catch (err) { /* la columna ya existía, no pasa nada */ }
 }
 
 function computeState(row, now) {
@@ -71,8 +78,10 @@ function computeState(row, now) {
 function toPublicFriend(row, now) {
   return {
     id: row.id,
-    // "name" es el apodo editable (lápiz); si nunca lo pusieron, el nombre premium, y si
-    // tampoco hay eso (todavía no logueó), un genérico.
+    // "name" es el apodo editable (lápiz); si nunca lo pusieron, el nombre premium DE LA
+    // SESIÓN ACTUAL, y si no hay sesión ahora mismo (deslogueado o nunca logueó), un genérico.
+    // OJO: "row.uuid"/"row.name" reflejan la sesión ACTUAL (se limpian al cerrar sesión), a
+    // diferencia de "known_uuid" que se usa solo internamente para sostener bloqueos.
     name: row.custom_name || row.name || 'Jugador',
     premiumName: row.name || null,
     uuid: row.uuid || null,
@@ -102,23 +111,31 @@ app.post('/api/heartbeat', async (req, res) => {
 
     const existing = await db.execute({ sql: 'SELECT * FROM players WHERE id = ?', args: [id] });
 
+    // "known_uuid" es la cuenta de Microsoft que ALGUNA VEZ usó esta instalación (se fija
+    // una sola vez y nunca se borra, ni al cerrar sesión): sirve para que un bloqueo no se
+    // pueda evadir cerrando sesión o reinstalando. "uuid"/"name" en cambio reflejan la
+    // SESIÓN ACTUAL nada más, y se limpian al cerrar sesión (por eso "Sin conectar" vuelve
+    // a aparecer cuando alguien se desloguea, en vez de quedar pegado el nombre viejo).
+    const priorKnownUuid = existing.rows.length ? (existing.rows[0].known_uuid || existing.rows[0].uuid || null) : null;
+    const effectiveKnownUuid = priorKnownUuid || safeUuid;
+
     // Si esta cuenta de Microsoft ya está bloqueada desde OTRA instalación, el bloqueo se
     // hereda acá también.
     let inheritedBan = null;
-    if (safeUuid) {
+    if (effectiveKnownUuid) {
       const bannedElsewhere = await db.execute({
-        sql: 'SELECT banned, banned_reason FROM players WHERE uuid = ? AND banned = 1 LIMIT 1',
-        args: [safeUuid]
+        sql: 'SELECT banned, banned_reason FROM players WHERE (known_uuid = ? OR uuid = ?) AND banned = 1 LIMIT 1',
+        args: [effectiveKnownUuid, effectiveKnownUuid]
       });
       if (bannedElsewhere.rows.length) inheritedBan = bannedElsewhere.rows[0];
     }
 
     if (existing.rows.length === 0) {
       await db.execute({
-        sql: `INSERT INTO players (id, uuid, name, custom_name, status, last_seen, banned, banned_reason, first_seen)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sql: `INSERT INTO players (id, known_uuid, uuid, name, custom_name, status, last_seen, banned, banned_reason, first_seen)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
-          id, safeUuid, safeName, safeCustomName, safeStatus, now,
+          id, effectiveKnownUuid, safeUuid, safeName, safeCustomName, safeStatus, now,
           inheritedBan ? 1 : 0, inheritedBan ? inheritedBan.banned_reason : null, now
         ]
       });
@@ -130,10 +147,10 @@ app.post('/api/heartbeat', async (req, res) => {
     const bannedReason = row.banned ? row.banned_reason : (inheritedBan ? inheritedBan.banned_reason : null);
 
     await db.execute({
-      sql: `UPDATE players SET uuid = COALESCE(?, uuid), name = COALESCE(?, name),
+      sql: `UPDATE players SET known_uuid = ?, uuid = ?, name = ?,
             custom_name = ?, status = ?, last_seen = ?, banned = ?, banned_reason = ?
             WHERE id = ?`,
-      args: [safeUuid, safeName, safeCustomName, safeStatus, now, banned ? 1 : 0, bannedReason, id]
+      args: [effectiveKnownUuid, safeUuid, safeName, safeCustomName, safeStatus, now, banned ? 1 : 0, bannedReason, id]
     });
 
     return res.json({ banned, bannedReason: bannedReason || null });
@@ -190,11 +207,12 @@ app.post('/api/admin/ban', requireAdmin, async (req, res) => {
   try {
     const { id, reason } = req.body || {};
     if (!id) return res.status(400).json({ error: 'Falta id.' });
-    const row = (await db.execute({ sql: 'SELECT uuid FROM players WHERE id = ?', args: [id] })).rows[0];
+    const row = (await db.execute({ sql: 'SELECT known_uuid, uuid FROM players WHERE id = ?', args: [id] })).rows[0];
     await db.execute({ sql: 'UPDATE players SET banned = 1, banned_reason = ? WHERE id = ?', args: [reason || null, id] });
     // Propaga el bloqueo a cualquier otra instalación que ya haya usado la misma cuenta.
-    if (row && row.uuid) {
-      await db.execute({ sql: 'UPDATE players SET banned = 1, banned_reason = ? WHERE uuid = ?', args: [reason || null, row.uuid] });
+    const targetUuid = row && (row.known_uuid || row.uuid);
+    if (targetUuid) {
+      await db.execute({ sql: 'UPDATE players SET banned = 1, banned_reason = ? WHERE known_uuid = ? OR uuid = ?', args: [reason || null, targetUuid, targetUuid] });
     }
     res.json({ success: true });
   } catch (err) {
@@ -207,10 +225,11 @@ app.post('/api/admin/unban', requireAdmin, async (req, res) => {
   try {
     const { id } = req.body || {};
     if (!id) return res.status(400).json({ error: 'Falta id.' });
-    const row = (await db.execute({ sql: 'SELECT uuid FROM players WHERE id = ?', args: [id] })).rows[0];
+    const row = (await db.execute({ sql: 'SELECT known_uuid, uuid FROM players WHERE id = ?', args: [id] })).rows[0];
     await db.execute({ sql: 'UPDATE players SET banned = 0, banned_reason = NULL WHERE id = ?', args: [id] });
-    if (row && row.uuid) {
-      await db.execute({ sql: 'UPDATE players SET banned = 0, banned_reason = NULL WHERE uuid = ?', args: [row.uuid] });
+    const targetUuid = row && (row.known_uuid || row.uuid);
+    if (targetUuid) {
+      await db.execute({ sql: 'UPDATE players SET banned = 0, banned_reason = NULL WHERE known_uuid = ? OR uuid = ?', args: [targetUuid, targetUuid] });
     }
     res.json({ success: true });
   } catch (err) {
