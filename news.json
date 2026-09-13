@@ -1,12 +1,7 @@
 [
   {
-    "date": "2026-09-11",
-    "title": "Bienvenidos a SKY ASHES 2",
-    "body": "Primera versión del launcher. Cualquier cambio en el modpack va a aparecer acá."
-  },
-  {
-    "date": "2026-09-15",
-    "title": "Nerf a la duración del sueño",
-    "body": "Se ajustó config/sleepvote.toml. Actualizá el modpack para aplicarlo."
+    "date": "2026-09-12",
+    "title": "Bienvenidos a V-SPACE 1.0.2",
+    "body": "Tercera versión del launcher. Cualquier cambio va a aparecer acá."
   }
 ]
