@@ -1,7 +1,12 @@
 [
   {
     "date": "2026-09-12",
-    "title": "Bienvenidos a V-SPACE 1.0.3",
+    "title": "Bienvenidos a V-SPACE 1.0.2",
     "body": "Tercera versión del launcher. Cualquier cambio va a aparecer acá."
+  }
+  {
+    "date": "2026-09-12",
+    "title": "ACTUALIZACIÓN 1.0.3",
+    "body": "Ya no pueden descargar el modpack desde actualizaciones."
   }
 ]
