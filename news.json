@@ -1,12 +1,7 @@
 [
   {
-    "date": "2026-09-11",
-    "title": "Bienvenidos a SKY ASHES 2",
-    "body": "Primera versión del launcher. Cualquier cambio en el modpack va a aparecer acá."
-  },
-  {
-    "date": "2026-09-15",
-    "title": "Nerf a la duración del sueño",
-    "body": "Se ajustó config/sleepvote.toml. Actualizá el modpack para aplicarlo."
+    "date": "14/09/2026",
+    "title": "Bienvenidos a V-SPACE 1.0.8",
+    "body": "Cambios: Mejoras en comportamientos del launcher. | Se agregó I.A que te dice porque crasheo el minecraft."
   }
 ]
