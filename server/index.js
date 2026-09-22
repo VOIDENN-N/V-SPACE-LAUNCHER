@@ -67,6 +67,18 @@ async function initDb() {
   try {
     await db.execute('ALTER TABLE players ADD COLUMN known_uuid TEXT');
   } catch (err) { /* la columna ya existía, no pasa nada */ }
+  try {
+    await db.execute('ALTER TABLE players ADD COLUMN tester INTEGER NOT NULL DEFAULT 0');
+  } catch (err) { /* la columna ya existia, no pasa nada */ }
+  // Mismo tipo de migración suave para el rol cosmético (nombre + color): antes era
+  // puramente local (solo lo veía cada uno de sí mismo), ahora se manda en el heartbeat
+  // para que se pueda mostrar en el popover de "Amigos" de todos los demás launchers.
+  try {
+    await db.execute('ALTER TABLE players ADD COLUMN role_tag TEXT');
+  } catch (err) { /* la columna ya existía, no pasa nada */ }
+  try {
+    await db.execute('ALTER TABLE players ADD COLUMN role_color TEXT');
+  } catch (err) { /* la columna ya existía, no pasa nada */ }
 }
 
 function computeState(row, now) {
@@ -85,7 +97,10 @@ function toPublicFriend(row, now) {
     name: row.custom_name || row.name || 'Jugador',
     premiumName: row.name || null,
     uuid: row.uuid || null,
-    state: computeState(row, now) // 'online' | 'away' | 'offline'
+    roleTag: row.role_tag || null,
+    roleColor: row.role_color || null,
+    state: computeState(row, now), // 'online' | 'away' | 'offline'
+    tester: !!row.tester
   };
 }
 
@@ -99,7 +114,7 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 // ---------- Heartbeat (lo llama cada launcher apenas se abre, con o sin sesión) ----------
 app.post('/api/heartbeat', async (req, res) => {
   try {
-    const { id, uuid, name, customName, status } = req.body || {};
+    const { id, uuid, name, customName, status, roleTag, roleColor } = req.body || {};
     if (!id || typeof id !== 'string') {
       return res.status(400).json({ error: 'Falta id.' });
     }
@@ -108,6 +123,12 @@ app.post('/api/heartbeat', async (req, res) => {
     const safeCustomName = typeof customName === 'string' ? customName.trim().slice(0, 20) : null;
     const safeUuid = typeof uuid === 'string' && uuid ? uuid : null;
     const safeName = typeof name === 'string' && name ? name : null;
+    const safeRoleTag = typeof roleTag === 'string' ? roleTag.trim().slice(0, 16) || null : null;
+    // Solo aceptamos un hex de color válido (#abc o #aabbcc): así nadie puede meter HTML/CSS
+    // arbitrario en un campo que se termina usando como "style.color" en el launcher de todos.
+    const safeRoleColor = typeof roleColor === 'string' && /^#[0-9a-fA-F]{3,6}$/.test(roleColor.trim())
+      ? roleColor.trim()
+      : null;
 
     const existing = await db.execute({ sql: 'SELECT * FROM players WHERE id = ?', args: [id] });
 
@@ -132,11 +153,12 @@ app.post('/api/heartbeat', async (req, res) => {
 
     if (existing.rows.length === 0) {
       await db.execute({
-        sql: `INSERT INTO players (id, known_uuid, uuid, name, custom_name, status, last_seen, banned, banned_reason, first_seen)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sql: `INSERT INTO players (id, known_uuid, uuid, name, custom_name, status, last_seen, banned, banned_reason, first_seen, role_tag, role_color)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           id, effectiveKnownUuid, safeUuid, safeName, safeCustomName, safeStatus, now,
-          inheritedBan ? 1 : 0, inheritedBan ? inheritedBan.banned_reason : null, now
+          inheritedBan ? 1 : 0, inheritedBan ? inheritedBan.banned_reason : null, now,
+          safeRoleTag, safeRoleColor
         ]
       });
       return res.json({ banned: !!inheritedBan, bannedReason: inheritedBan ? inheritedBan.banned_reason : null });
@@ -148,12 +170,13 @@ app.post('/api/heartbeat', async (req, res) => {
 
     await db.execute({
       sql: `UPDATE players SET known_uuid = ?, uuid = ?, name = ?,
-            custom_name = ?, status = ?, last_seen = ?, banned = ?, banned_reason = ?
+            custom_name = ?, status = ?, last_seen = ?, banned = ?, banned_reason = ?,
+            role_tag = ?, role_color = ?
             WHERE id = ?`,
-      args: [effectiveKnownUuid, safeUuid, safeName, safeCustomName, safeStatus, now, banned ? 1 : 0, bannedReason, id]
+      args: [effectiveKnownUuid, safeUuid, safeName, safeCustomName, safeStatus, now, banned ? 1 : 0, bannedReason, safeRoleTag, safeRoleColor, id]
     });
 
-    return res.json({ banned, bannedReason: bannedReason || null });
+    return res.json({ banned, bannedReason: bannedReason || null, tester: !!row.tester });
   } catch (err) {
     console.error('Error en /api/heartbeat:', err);
     res.status(500).json({ error: 'Error interno.' });
@@ -239,14 +262,21 @@ app.post('/api/admin/unban', requireAdmin, async (req, res) => {
 });
 
 // Elimina a alguien de la lista (no lo bloquea: si vuelve a abrir el launcher, reaparece).
-app.post('/api/admin/delete', requireAdmin, async (req, res) => {
+
+
+app.post('/api/admin/tester', requireAdmin, async (req, res) => {
   try {
-    const { id } = req.body || {};
+    const { id, tester } = req.body || {};
     if (!id) return res.status(400).json({ error: 'Falta id.' });
-    await db.execute({ sql: 'DELETE FROM players WHERE id = ?', args: [id] });
+    const row = (await db.execute({ sql: 'SELECT known_uuid, uuid FROM players WHERE id = ?', args: [id] })).rows[0];
+    await db.execute({ sql: 'UPDATE players SET tester = ? WHERE id = ?', args: [tester ? 1 : 0, id] });
+    const targetUuid = row && (row.known_uuid || row.uuid);
+    if (targetUuid) {
+      await db.execute({ sql: 'UPDATE players SET tester = ? WHERE known_uuid = ? OR uuid = ?', args: [tester ? 1 : 0, targetUuid, targetUuid] });
+    }
     res.json({ success: true });
   } catch (err) {
-    console.error('Error en /api/admin/delete:', err);
+    console.error('Error en /api/admin/tester:', err);
     res.status(500).json({ error: 'Error interno.' });
   }
 });
@@ -259,3 +289,6 @@ initDb()
     console.error('No se pudo inicializar la base de datos:', err);
     process.exit(1);
   });
+
+
+
