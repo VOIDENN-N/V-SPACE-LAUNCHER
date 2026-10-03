@@ -1,7 +1,7 @@
 [
   {
     "date": "2026-10-03",
-    "title": "Barra de Descarga",
-    "body": "Ahora en la 2.0.6, al descargar una actualizacion del launcher aparecerá una barra de descarga."
+    "title": "CRASHEOS",
+    "body": "Al crashear, van a poder ver el error en pantalla en vez de un texto predeterminado. A su vez, nueva integración a las novedades \"MOSTRAR TODO\""
   }
 ]
