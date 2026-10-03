@@ -1,7 +1,7 @@
 [
   {
     "date": "2026-10-03",
-    "title": "Fix de bugs",
-    "body": "Arreglé varios bugs, así como intentos fallidos de descarga de SKY ASHES 2. Además, agregué un botón que activa o desactiva DISTANT HORIZONS al modpack de Sky Ashes 2, A su vez optimicé la velocidad de reacción a una nueva actualización de modpack."
+    "title": "Barra de Descarga",
+    "body": "Ahora en la 2.0.6, al descargar una actualizacion del launcher aparecerá una barra de descarga."
   }
 ]
