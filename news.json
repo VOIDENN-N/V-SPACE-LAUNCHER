@@ -2,6 +2,13 @@
   {
     "date": "2026-10-05",
     "title": "Screenshots",
-    "body": "Ya funciona el botón \"COPIAR IMAGEN\" y tiene su propia barra deslizadora por si tenes muchas screenshots."
+    "body": "Ya funciona el boton \"COPIAR IMAGEN\" y tiene su propia barra deslizadora por si tenes muchas screenshots."
+  },
+  {
+    "id": "cambios-semanales-sky-ashes-2",
+    "date": "2026-10-07",
+    "title": "ACTUALIZACION SEMANAL: JEFES, RACHA Y ECONOMIA",
+    "image": "assets/news.png",
+    "body": "Resumen directo de los cambios aplicados durante la semana en Sky Ashes 2:\n\n## BOSSES DIARIOS\n- Invocacion y combate de un nuevo jefe cada dia.\n- Recompensas especiales y monedas al completar la caceria diaria.\n\n## SISTEMA DE RACHA DIARIA\n- Registro de conexion y actividad diaria consecutiva.\n- Recompensas acumulativas y mejores premios por mantener la racha.\n\n## BOLSAS DE MONEDAS CRAFTEABLES\n- Crafteo de Bolsas de Cuero y Sacos de Arpillera para no saturar el inventario.\n- Clic derecho con el contenedor vacio para comprimir tus Lirias y Cenizos.\n- Clic derecho con la bolsa llena para extraer tus monedas al instante.\n\n## NUEVAS MISIONES Y AJUSTES\n- Nuevos capitulos en el libro de misiones con recompensas directas.\n- Ajustes de balance en comercio, economia y crafteos."
   }
 ]
