@@ -104,6 +104,42 @@ function toPublicFriend(row, now) {
   };
 }
 
+function deduplicateFriends(friends) {
+  if (!Array.isArray(friends)) return [];
+  const byUuid = new Map();
+  const withoutUuid = [];
+  for (const f of friends) {
+    if (!f) continue;
+    const u = f.uuid ? String(f.uuid).trim().toLowerCase() : null;
+    if (u) {
+      if (!byUuid.has(u)) {
+        byUuid.set(u, f);
+      } else {
+        const prev = byUuid.get(u);
+        if (f.state !== 'offline' && prev.state === 'offline') {
+          byUuid.set(u, f);
+        } else if (f.roleTag && !prev.roleTag) {
+          byUuid.set(u, { ...prev, roleTag: f.roleTag, roleColor: f.roleColor || prev.roleColor });
+        }
+      }
+    } else {
+      withoutUuid.push(f);
+    }
+  }
+  const knownNames = new Set(
+    Array.from(byUuid.values()).map(f => (f.name || f.premiumName || '').trim().toLowerCase()).filter(Boolean)
+  );
+  const keptNoUuid = [];
+  const seenNames = new Set();
+  for (const f of withoutUuid) {
+    const n = (f.name || '').trim().toLowerCase();
+    if (knownNames.has(n) || seenNames.has(n)) continue;
+    seenNames.add(n);
+    keptNoUuid.push(f);
+  }
+  return [...byUuid.values(), ...keptNoUuid];
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -161,6 +197,14 @@ app.post('/api/heartbeat', async (req, res) => {
           safeRoleTag, safeRoleColor
         ]
       });
+      if (safeUuid) {
+        try {
+          await db.execute({
+            sql: 'DELETE FROM players WHERE (known_uuid = ? OR uuid = ?) AND id != ?',
+            args: [safeUuid, safeUuid, id]
+          });
+        } catch (_) {}
+      }
       return res.json({ banned: !!inheritedBan, bannedReason: inheritedBan ? inheritedBan.banned_reason : null });
     }
 
@@ -176,6 +220,15 @@ app.post('/api/heartbeat', async (req, res) => {
       args: [effectiveKnownUuid, safeUuid, safeName, safeCustomName, safeStatus, now, banned ? 1 : 0, bannedReason, safeRoleTag, safeRoleColor, id]
     });
 
+    if (safeUuid) {
+      try {
+        await db.execute({
+          sql: 'DELETE FROM players WHERE (known_uuid = ? OR uuid = ?) AND id != ?',
+          args: [safeUuid, safeUuid, id]
+        });
+      } catch (_) {}
+    }
+
     return res.json({ banned, bannedReason: bannedReason || null, tester: !!row.tester });
   } catch (err) {
     console.error('Error en /api/heartbeat:', err);
@@ -188,8 +241,8 @@ app.get('/api/friends', async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM players WHERE banned = 0');
     const now = Date.now();
-    const friends = result.rows
-      .map((row) => toPublicFriend(row, now))
+    const rawFriends = result.rows.map((row) => toPublicFriend(row, now));
+    const friends = deduplicateFriends(rawFriends)
       .sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
     res.json({ friends });
   } catch (err) {
@@ -212,12 +265,12 @@ app.get('/api/admin/friends', requireAdmin, async (req, res) => {
   try {
     const result = await db.execute('SELECT * FROM players');
     const now = Date.now();
-    const friends = result.rows
-      .map((row) => ({
-        ...toPublicFriend(row, now),
-        banned: !!row.banned,
-        bannedReason: row.banned_reason || null
-      }))
+    const rawFriends = result.rows.map((row) => ({
+      ...toPublicFriend(row, now),
+      banned: !!row.banned,
+      bannedReason: row.banned_reason || null
+    }));
+    const friends = deduplicateFriends(rawFriends)
       .sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
     res.json({ friends });
   } catch (err) {
@@ -262,7 +315,22 @@ app.post('/api/admin/unban', requireAdmin, async (req, res) => {
 });
 
 // Elimina a alguien de la lista (no lo bloquea: si vuelve a abrir el launcher, reaparece).
-
+app.post('/api/admin/delete', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.body || {};
+    if (!id) return res.status(400).json({ error: 'Falta id.' });
+    const row = (await db.execute({ sql: 'SELECT known_uuid, uuid, name FROM players WHERE id = ?', args: [id] })).rows[0];
+    await db.execute({ sql: 'DELETE FROM players WHERE id = ?', args: [id] });
+    const targetUuid = row && (row.known_uuid || row.uuid);
+    if (targetUuid) {
+      await db.execute({ sql: 'DELETE FROM players WHERE (known_uuid = ? OR uuid = ?) AND id != ?', args: [targetUuid, targetUuid, id] });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error en /api/admin/delete:', err);
+    res.status(500).json({ error: 'Error interno.' });
+  }
+});
 
 app.post('/api/admin/tester', requireAdmin, async (req, res) => {
   try {
