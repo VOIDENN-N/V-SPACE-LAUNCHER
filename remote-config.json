@@ -1,6 +1,9 @@
 {
-  "launcherTitle": "SKY ASHES 2 (FINALIZADO)",
-  "modpackLocked": true,
-  "serverFinished": true,
-  "modpackFinished": true
+  "launcherTitle": "ECLIPSE (PROXIMAMENTE)",
+  "modpackId": "eclipse",
+  "modpackLocked": false,
+  "serverFinished": false,
+  "modpackFinished": false,
+  "requireAccessKey": false,
+  "accessKeyVerifyUrl": "https://www.v-space.online/api/verify-key"
 }
