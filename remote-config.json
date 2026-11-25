@@ -1,6 +1,8 @@
 {
   "launcherTitle": "ECLIPSE (PROXIMAMENTE)",
   "modpackId": "eclipse",
+  "serverHost": "eclipse2026loydvoidenn.globalelite.club",
+  "serverPort": 25565,
   "modpackLocked": false,
   "serverFinished": false,
   "modpackFinished": false,
